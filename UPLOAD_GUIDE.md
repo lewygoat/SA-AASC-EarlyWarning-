@@ -2,7 +2,7 @@
 
 ## 1. 在 GitHub 建仓库
 
-登录后点 New repository，名称建议 `SA-AASC-EarlyWarning`，可见性按论文投稿需要选择。
+登录后点 New repository，名称建议 `SA-AASC-EarlyWarning-`，可见性按论文投稿需要选择。
 **不要**勾选 Add a README、.gitignore 或 license，本项目已自带，避免冲突。
 
 ## 2. 上传
@@ -19,15 +19,14 @@ git init
 git add .
 git commit -m "Initial commit: MA-TempNet+GBDT and SA-AASC reference implementation"
 git branch -M main
-git remote add origin https://github.com/<用户名>/SA-AASC-EarlyWarning.git
+git remote add origin https://github.com/<用户名>/SA-AASC-EarlyWarning-.git
 git push -u origin main
 ```
 
 ## 3. 上传前必须替换的占位符
 
 `CITATION.cff` 里的 `repository-code` 一项现在写的是
-`https://github.com/<your-account>/SA-AASC-EarlyWarning`，把 `<your-account>` 换成你的
-GitHub 用户名。README 末段若你的仓库地址与之不同也一并改。
+`https://github.com/lewygoat/SA-AASC-EarlyWarning-`，仓库地址已指向 `lewygoat`。README 末段若你的仓库地址与之不同也一并改。
 
 ## 4. 数据不入库
 
@@ -42,7 +41,7 @@ OULAD 单个 `final.csv` 有 20 MB，超过 GitHub 建议的仓库体积，放�
 克隆到本地空目录跑一次冒烟测试，确认他人能复现。
 
 ```bash
-git clone https://github.com/<用户名>/SA-AASC-EarlyWarning.git
+git clone https://github.com/<用户名>/SA-AASC-EarlyWarning-.git
 cd SA-AASC-EarlyWarning
 pip install -r requirements.txt
 python src/run_experiments.py --mode smoke

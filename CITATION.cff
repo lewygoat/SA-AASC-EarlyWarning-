@@ -8,7 +8,7 @@ authors:
 year: 2026
 type: software
 license: MIT
-repository-code: "https://github.com/<your-account>/SA-AASC-EarlyWarning"
+repository-code: "https://github.com/lewygoat/SA-AASC-EarlyWarning-"
 abstract: >-
   Reference implementation of MA-TempNet+GBDT and SA-AASC for longitudinal
   student risk prediction and capacity-constrained group counterfactual recourse
