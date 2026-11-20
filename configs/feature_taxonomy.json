@@ -1,0 +1,185 @@
+{
+  "description": "Four-tier mutability taxonomy (F_beh, F_out, F_inst, F_imm) plus derived missingness indicators (F_der) and monotonic improvement cones (s_j in {+1, -1}) across OULAD, UCI #697, and xAPI-Edu-Data.",
+  "datasets": {
+    "UCI #697": {
+      "n_samples": 4424,
+      "n_features": 36,
+      "tiers": {
+        "F_beh": [
+          "Curricular units 1st sem (evaluations)",
+          "Curricular units 2nd sem (evaluations)",
+          "Curricular units 1st sem (without evaluations)",
+          "Curricular units 2nd sem (without evaluations)"
+        ],
+        "F_out": [
+          "Curricular units 1st sem (approved)",
+          "Curricular units 1st sem (grade)",
+          "Curricular units 2nd sem (approved)",
+          "Curricular units 2nd sem (grade)"
+        ],
+        "F_inst": [
+          "Debtor",
+          "Tuition fees up to date",
+          "Scholarship holder",
+          "Curricular units 1st sem (credited)",
+          "Curricular units 1st sem (enrolled)",
+          "Curricular units 2nd sem (credited)",
+          "Curricular units 2nd sem (enrolled)"
+        ],
+        "F_imm": [
+          "Marital status",
+          "Application mode",
+          "Application order",
+          "Course",
+          "Daytime/evening attendance",
+          "Previous qualification",
+          "Previous qualification (grade)",
+          "Nacionality",
+          "Mother's qualification",
+          "Father's qualification",
+          "Mother's occupation",
+          "Father's occupation",
+          "Admission grade",
+          "Displaced",
+          "Educational special needs",
+          "Gender",
+          "Age at enrollment",
+          "International",
+          "Unemployment rate",
+          "Inflation rate",
+          "GDP"
+        ],
+        "F_der": []
+      },
+      "monotonic_dirs": {
+        "Curricular units 1st sem (evaluations)": 1,
+        "Curricular units 2nd sem (evaluations)": 1,
+        "Curricular units 1st sem (without evaluations)": -1,
+        "Curricular units 2nd sem (without evaluations)": -1,
+        "Curricular units 1st sem (approved)": 1,
+        "Curricular units 1st sem (grade)": 1,
+        "Curricular units 2nd sem (approved)": 1,
+        "Curricular units 2nd sem (grade)": 1
+      },
+      "budgets_iqr": {
+        "low": 3.2,
+        "mid": 5.2,
+        "high": 7.8
+      },
+      "default_clusters_K": 22
+    },
+    "xAPI-Edu": {
+      "n_samples": 480,
+      "n_features": 16,
+      "tiers": {
+        "F_beh": [
+          "raisedhands",
+          "VisITedResources",
+          "AnnouncementsView",
+          "Discussion",
+          "StudentAbsenceDays"
+        ],
+        "F_out": [],
+        "F_inst": [
+          "Semester"
+        ],
+        "F_imm": [
+          "gender",
+          "NationalITy",
+          "PlaceofBirth",
+          "StageID",
+          "GradeID",
+          "SectionID",
+          "Topic",
+          "Relation",
+          "ParentAnsweringSurvey",
+          "ParentschoolSatisfaction"
+        ],
+        "F_der": []
+      },
+      "monotonic_dirs": {
+        "raisedhands": 1,
+        "VisITedResources": 1,
+        "AnnouncementsView": 1,
+        "Discussion": 1,
+        "StudentAbsenceDays": -1
+      },
+      "budgets_iqr": {
+        "low": 1.6,
+        "mid": 2.6,
+        "high": 4.0
+      },
+      "default_clusters_K": 20
+    },
+    "OULAD": {
+      "n_registrations_full": 32593,
+      "n_survivors_40pct": 25224,
+      "n_eval_subsample": 4500,
+      "n_features": 31,
+      "tiers": {
+        "F_beh": [
+          "submission_completion_ratio",
+          "tma_engagement",
+          "cma_engagement",
+          "early_preparation_days",
+          "late_submission_rate",
+          "submission_recency_gap",
+          "derived_submission_index"
+        ],
+        "F_out": [
+          "score_mean",
+          "score_count",
+          "score_std",
+          "score_max",
+          "score_min",
+          "weighted_score_sum"
+        ],
+        "F_inst": [
+          "num_of_prev_attempts",
+          "studied_credits",
+          "date_registration",
+          "module_presentation_length",
+          "banked_count"
+        ],
+        "F_imm": [
+          "code_module",
+          "code_presentation",
+          "gender",
+          "region",
+          "highest_education",
+          "imd_band",
+          "age_band",
+          "disability"
+        ],
+        "F_der": [
+          "missingindicator_score_mean",
+          "missingindicator_score_count",
+          "missingindicator_score_std",
+          "missingindicator_date_registration",
+          "missingindicator_imd_band"
+        ]
+      },
+      "monotonic_dirs": {
+        "submission_completion_ratio": 1,
+        "tma_engagement": 1,
+        "cma_engagement": 1,
+        "early_preparation_days": 1,
+        "late_submission_rate": -1,
+        "submission_recency_gap": -1,
+        "derived_submission_index": 1,
+        "score_mean": 1,
+        "score_count": 1,
+        "score_std": 1,
+        "score_max": 1,
+        "score_min": 1,
+        "weighted_score_sum": 1
+      },
+      "budgets_iqr": {
+        "low": 3.0,
+        "mid": 5.0,
+        "high": 7.5
+      },
+      "default_clusters_K": 21
+    }
+  }
+}
