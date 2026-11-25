@@ -3,25 +3,32 @@ Stage-Aware Actionable Attribution-Subspace Clustering (SA-AASC) and
 Capacity-Bounded Bi-Stage Counterfactual Group Recourse Optimizer.
 
 Implements:
-1. Coalitional Shapley-equivalent marginal log-odds attributions phi_{i,j}
+1. Out-of-fold (OOF) tabular ensemble wrapper (`OOFTabularEnsemble`) ensuring that
+   no evaluated learner participates in fitting the counterfactual scoring model,
+   reference quantiles, IQR scales, or background attribution pool.
+2. Coalitional Shapley-equivalent marginal log-odds attributions phi_{i,j}
    and tier-wise attribution share profiling across course stages (20%..80%).
-2. Four clustering spaces for group counterfactual generation:
-   - B1_Raw_X: K-Means in full standardized feature space R^d (Paper 1 baseline)
+3. Four clustering spaces for group counterfactual generation:
+   - B1_Raw_X: K-Means in full standardized feature space R^d
    - B2_Actionable_X: K-Means in raw actionable feature subspace R^{|F_act|}
    - B3_Full_SHAP: K-Means in unconstrained full attribution space R^d
    - Proposed_SA_AASC: Directional spherical clustering in the monotonic-feasible
      actionable attribution subspace paired with boundary logit-gap stratification.
-3. Four-stage nested counterfactual constraint optimization (A1_none, A2_tier,
-   A3_monotone, A4_budget@low/mid/high) and Bi-Stage Hybrid Recourse
-   (Shared Group Prescription Template + 1-Feature Sparse Residual Compensation).
+4. Strictly matched 96-candidate water-filling counterfactual optimization across
+   nested constraint regimes (A1_none, A2_tier, A3_monotone, A4_budget@low/mid/high),
+   coordinate-restricted monotonic clipping (strictly enforcing ||delta||_0 <= 3 and
+   C(delta) <= B for every individual), Bi-Stage Hybrid 1-feature residual recourse,
+   and paired student-level bootstrap confidence intervals.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from sklearn.cluster import KMeans
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
 
@@ -40,6 +47,92 @@ def compute_iqr_scales(X_train: np.ndarray) -> np.ndarray:
     return scale
 
 
+class OOFTabularEnsemble:
+    """
+    Five-fold stratified out-of-fold histogram GBDT ensemble for leak-free
+    attribution and counterfactual recourse evaluation. Every learner i is
+    scored strictly by the fold model f_tab^{(-k(i))} fitted without learner i.
+    """
+
+    def __init__(self, X: np.ndarray, y: np.ndarray, n_splits: int = 5, seed: int = 42):
+        self.n = len(y)
+        self.d = X.shape[1]
+        self.n_splits = n_splits
+        self.seed = seed
+        self.fold_of = np.zeros(self.n, dtype=int)
+        self.tr_masks: List[np.ndarray] = []
+        self.models: List[HistGradientBoostingClassifier] = []
+        self.oof_probs = np.zeros(self.n, dtype=np.float64)
+
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        for f_id, (tr_idx, te_idx) in enumerate(skf.split(X, y)):
+            tr_mask = np.zeros(self.n, dtype=bool)
+            tr_mask[tr_idx] = True
+            self.tr_masks.append(tr_mask)
+            self.fold_of[te_idx] = f_id
+
+            m = HistGradientBoostingClassifier(
+                max_iter=180,
+                learning_rate=0.055,
+                max_leaf_nodes=31,
+                min_samples_leaf=15,
+                l2_regularization=1.0,
+                random_state=seed,
+            )
+            m.fit(X[tr_idx], y[tr_idx])
+            self.models.append(m)
+            self.oof_probs[te_idx] = m.predict_proba(X[te_idx])[:, 1]
+
+    def predict_for_indices(self, X_eval: np.ndarray, orig_indices: np.ndarray) -> np.ndarray:
+        """Predict out-of-fold probabilities for 2D array (n_sub, d) aligned with orig_indices."""
+        out = np.zeros(len(X_eval), dtype=np.float64)
+        folds = self.fold_of[orig_indices]
+        for f_id in np.unique(folds):
+            mask = folds == f_id
+            out[mask] = self.models[int(f_id)].predict_proba(X_eval[mask])[:, 1]
+        return np.clip(out, 1e-6, 1.0 - 1e-6)
+
+    def predict_batch_for_indices(self, X_batch_3d: np.ndarray, orig_indices: np.ndarray) -> np.ndarray:
+        """Vectorized out-of-fold prediction for 3D candidate batch (M, n_sub, d)."""
+        n_m, n_c, d = X_batch_3d.shape
+        out = np.zeros((n_m, n_c), dtype=np.float64)
+        folds = self.fold_of[orig_indices]
+        for f_id in np.unique(folds):
+            cols = np.where(folds == f_id)[0]
+            flat = X_batch_3d[:, cols, :].reshape(n_m * len(cols), d)
+            preds = self.models[int(f_id)].predict_proba(flat)[:, 1].reshape(n_m, len(cols))
+            out[:, cols] = preds
+        return np.clip(out, 1e-6, 1.0 - 1e-6)
+
+    def predict_single_student_trials(self, trial_rows: np.ndarray, orig_index: int) -> np.ndarray:
+        """Predict out-of-fold probabilities for candidate perturbations of one held-out learner."""
+        f_id = int(self.fold_of[int(orig_index)])
+        return np.clip(self.models[f_id].predict_proba(trial_rows)[:, 1], 1e-6, 1.0 - 1e-6)
+
+    def compute_oof_shap(
+        self,
+        X_all: np.ndarray,
+        eval_indices: np.ndarray,
+        n_coalitions: int = 8,
+        seed: int = 42,
+    ) -> np.ndarray:
+        """Compute strictly out-of-fold coalitional log-odds attributions using training-fold backgrounds."""
+        phi = np.zeros((len(eval_indices), X_all.shape[1]), dtype=np.float64)
+        folds = self.fold_of[eval_indices]
+        for f_id in np.unique(folds):
+            local_mask = folds == f_id
+            sub_indices = eval_indices[local_mask]
+            X_bg = X_all[self.tr_masks[int(f_id)]]
+            phi[local_mask] = compute_local_shap_attributions(
+                lambda z, fid=int(f_id): self.models[fid].predict_proba(z)[:, 1],
+                X_all[sub_indices],
+                X_bg,
+                n_coalitions=n_coalitions,
+                seed=seed,
+            )
+        return phi
+
+
 def compute_local_shap_attributions(
     predict_proba_fn: Callable[[np.ndarray], np.ndarray],
     X_eval: np.ndarray,
@@ -52,6 +145,8 @@ def compute_local_shap_attributions(
     for each instance i in X_eval across all d features.
     Positive phi_{i,j} > 0 indicates feature j pushes student i TOWARD risk (class 1).
     """
+    if len(X_eval) == 0:
+        return np.zeros((0, X_bg.shape[1]), dtype=np.float64)
     rng = np.random.RandomState(seed)
     n_eval, d = X_eval.shape
     bg_Idx = rng.choice(len(X_bg), size=min(len(X_bg), n_coalitions), replace=False)
@@ -64,8 +159,6 @@ def compute_local_shap_attributions(
     shared_masks = [rng.binomial(1, 0.5, size=(1, d)).astype(bool) for _ in range(2)]
 
     for j in range(d):
-        # Marginal contribution from replacing feature j with background references
-        # and from mid-coalition interpolation
         delta_sum = np.zeros(n_eval, dtype=np.float64)
         n_r = min(4, len(bg_refs))
         for k_idx in range(n_r):
@@ -74,7 +167,6 @@ def compute_local_shap_attributions(
             logit_pert = _prob_to_logit(predict_proba_fn(X_pert))
             delta_sum += (base_logits - logit_pert)
 
-        # Shared paired coalition mask evaluation (50% active feature subsets)
         coal_sum = np.zeros(n_eval, dtype=np.float64)
         for m_bool in shared_masks:
             X_with_j = np.where(m_bool, X_eval, ref_med[None, :])
@@ -87,7 +179,6 @@ def compute_local_shap_attributions(
 
         phi[:, j] = 0.60 * (delta_sum / float(n_r)) + 0.40 * (coal_sum / float(len(shared_masks)))
 
-    # Defensive check: ensure finite and non-degenerate attributions
     phi = np.nan_to_num(phi, nan=0.0, posinf=0.0, neginf=0.0)
     return phi
 
@@ -147,16 +238,17 @@ def cluster_at_risk_students(
     act_indices: List[int],
     monotonic_signs: Dict[int, int],
     feature_bounds: Tuple[np.ndarray, np.ndarray],
-    n_clusters: int = 15,
+    n_clusters: int = 20,
     seed: int = 42,
 ) -> np.ndarray:
     """
     Partition at-risk instances into `n_clusters` cohorts under 4 clustering spaces:
     - 'B1_Raw_X': K-Means on standardized full feature matrix X_at_risk
     - 'B2_Actionable_X': K-Means on standardized actionable feature values X_at_risk[:, act_indices]
-    - 'B3_Full_SHAP': K-Means on full-space attribution vectors phi_at_risk
-    - 'Proposed_SA_AASC': Directional spherical clustering in the feasible actionable
-      attribution subspace combined with boundary logit-gap stratification.
+    - 'B3_Full_SHAP' / 'B3_Full_SHAP_Cone': K-Means on standardized full attribution vectors phi_at_risk
+    - 'Proposed_SA_AASC' (and ablation variants 'SA_AASC_DirOnly', 'SA_AASC_DirPlusRoom'):
+      Directional clustering in the feasible actionable attribution subspace combined
+      with boundary logit-gap stratification.
     """
     n_samples = len(X_at_risk)
     k_eff = min(n_clusters, max(2, n_samples // 3))
@@ -165,7 +257,7 @@ def cluster_at_risk_students(
         Z = StandardScaler().fit_transform(X_at_risk)
     elif method == "B2_Actionable_X":
         Z = StandardScaler().fit_transform(X_at_risk[:, act_indices])
-    elif method == "B3_Full_SHAP":
+    elif method in ("B3_Full_SHAP", "B3_Full_SHAP_Cone"):
         Z = StandardScaler().fit_transform(phi_at_risk)
     elif method in ("Proposed_SA_AASC", "SA_AASC_DirOnly", "SA_AASC_DirPlusRoom"):
         q_lo, q_hi = feature_bounds
@@ -182,7 +274,6 @@ def cluster_at_risk_students(
                 room = np.maximum(0.0, X_at_risk[:, j] - q_lo[j]) / max(q_hi[j] - q_lo[j], 1e-6)
             feas_Room[:, pos_k] = np.clip(room, 0.0, 1.0)
             raw_pos_phi[:, pos_k] = np.maximum(0.0, phi_at_risk[:, j])
-            # Positive phi_{i,j} drives student toward risk; weight by feasible room
             deficit_phi[:, pos_k] = raw_pos_phi[:, pos_k] * (0.35 + 0.65 * feas_Room[:, pos_k])
 
         if method == "SA_AASC_DirOnly":
@@ -195,7 +286,6 @@ def cluster_at_risk_students(
         else:
             norms = np.linalg.norm(deficit_phi, axis=1, keepdims=True)
             dir_unit = np.where(norms > 1e-8, deficit_phi / np.maximum(norms, 1e-8), 0.0)
-            # Include normalized logit distance to threshold tau=0.5 so cluster members require compatible effort
             logit_gap = StandardScaler().fit_transform(_prob_to_logit(probs_at_risk)[:, None]) * 0.35
             Z = np.column_stack([dir_unit * 1.65, feas_Room * 0.85, logit_gap])
     else:
@@ -206,8 +296,66 @@ def cluster_at_risk_students(
     return labels
 
 
+def _apply_candidates_strict(
+    X_c: np.ndarray,
+    cand_arr: np.ndarray,
+    q_lo: np.ndarray,
+    q_hi: np.ndarray,
+    mono_map: Dict[int, int],
+    enforce_mono: bool,
+) -> np.ndarray:
+    """
+    Apply candidate shift vectors `cand_arr` (M, d) to cluster instances `X_c` (n_c, d)
+    ONLY along coordinates with non-zero shifts. Untouched and locked features remain
+    identically unchanged even when an instance lies outside the [2nd, 98th] training
+    quantile box, strictly preserving ||x_new - x||_0 <= ||delta||_0 <= 3 and
+    C(x_new - x) <= C(delta) <= B for every individual.
+    """
+    n_m, d = cand_arr.shape
+    n_c = len(X_c)
+    X_batch = np.broadcast_to(X_c[None, :, :], (n_m, n_c, d)).copy()
+    nz_cols = np.where(np.any(np.abs(cand_arr) > 1e-12, axis=0))[0]
+    for j in nz_cols:
+        steps = cand_arr[:, j][:, None]  # (n_m, 1)
+        base_j = X_c[:, j][None, :]      # (1, n_c)
+        cand_j = base_j + steps
+        if enforce_mono:
+            s_j = mono_map.get(j, 1)
+            if s_j >= 0:
+                upper = np.maximum(base_j, q_hi[j])
+                res = np.where(steps > 0.0, np.minimum(cand_j, upper), base_j)
+            else:
+                lower = np.minimum(base_j, q_lo[j])
+                res = np.where(steps < 0.0, np.maximum(cand_j, lower), base_j)
+        else:
+            upper = np.maximum(base_j, q_hi[j])
+            lower = np.minimum(base_j, q_lo[j])
+            res = np.where(np.abs(steps) > 1e-12, np.clip(cand_j, lower, upper), base_j)
+        X_batch[:, :, j] = res
+    return X_batch
+
+
+def paired_bootstrap_validity_ci(
+    flips_a: np.ndarray,
+    flips_b: np.ndarray,
+    n_boot: int = 2000,
+    seed: int = 42,
+) -> Tuple[float, float, float]:
+    """
+    Compute paired student-level non-parametric bootstrap mean difference and 95% CI
+    for (Val(method A) - Val(method B)) on the shared evaluated at-risk cohort.
+    """
+    diff = flips_a.astype(np.float64) - flips_b.astype(np.float64)
+    n = len(diff)
+    rng = np.random.RandomState(seed)
+    idx = rng.randint(0, n, size=(n_boot, n))
+    boot_means = np.mean(diff[idx], axis=1)
+    lo, hi = np.percentile(boot_means, [2.5, 97.5])
+    return float(np.mean(diff)), float(lo), float(hi)
+
+
 def optimize_group_and_hybrid_recourse(
-    predict_proba_fn: Callable[[np.ndarray], np.ndarray],
+    predictor: Union[OOFTabularEnsemble, Callable[[np.ndarray], np.ndarray]],
     X_at_risk: np.ndarray,
     phi_at_risk: np.ndarray,
     labels: np.ndarray,
@@ -220,28 +368,31 @@ def optimize_group_and_hybrid_recourse(
     tau: float = 0.50,
     budgets: Dict[str, float] = {"low": 3.5, "mid": 5.5, "high": 8.0},
     use_water_filling: bool = True,
-) -> Dict[str, Dict[str, float]]:
+    orig_indices: Optional[np.ndarray] = None,
+    ref_probs: Optional[np.ndarray] = None,
+    return_vectors: bool = False,
+) -> Dict[str, Dict[str, Any]]:
     """
-    Solve the 4-stage nested counterfactual constraint ablation (A1_none, A2_tier,
+    Solve the 6 nested counterfactual constraint regimes (A1_none, A2_tier,
     A3_monotone, A4_budget@low/mid/high) for group-level cluster templates, plus
-    the Bi-Stage Hybrid Recourse (Group Template + 1-Feature Sparse Residual).
+    Stage-2 Bi-Stage Hybrid Recourse (Group Template + 1-Feature Sparse Residual).
 
-    All clustering paradigms are evaluated under the exact same feature cardinality
-    cap (k = 3), the exact same full effort budget B (no budget shrink factor), and
-    the same water-filling grid search over their paradigm-specific cluster targets:
-    - B1_Raw_X: moves toward the cluster centroid's nearest low-risk prototype in R^d
-    - B2_Actionable_X: moves toward the safe reference median in R^{|F_act|}
-    - B3_Full_SHAP: ranks features by unconstrained cluster-mean |SHAP| magnitude
-    - Proposed_SA_AASC (and SA_AASC_*): ranks features by feasibility-weighted positive
-      deficit attribution along the monotonic feasibility cone.
+    Fairness & leak-free guarantees:
+    - Every clustering method searches the EXACT SAME grid size: 3 top-feature subsets
+      ({j_1}, {j_1, j_2}, {j_1, j_2, j_3}) x 4 primary-feature budget split ratios
+      (1.00, 0.80, 0.65, 0.50) x 8 interpolation step sizes alpha in [0.25, 1.00]
+      = 96 candidate templates per cluster (10 uniform steps when use_water_filling=False).
+    - When `predictor` is an `OOFTabularEnsemble`, every candidate template and Stage-2
+      micro-adjustment for learner i is evaluated strictly on the held-out fold model
+      f_tab^{(-k(i))} that never trained on learner i.
+    - Coordinate-restricted monotonic clipping guarantees ||x_new - x||_0 <= 3 and
+      C(x_new - x) <= B for every individual learner without exception.
     """
     n_risk, d = X_at_risk.shape
     name_to_idx = {c: i for i, c in enumerate(feature_names)}
 
-    # Unlocked student-actionable set F_act = F_beh U F_out (and F_inst when unlocked in institutional routing)
     act_cols = tiers.get("F_beh", []) + tiers.get("F_out", [])
     act_indices = [name_to_idx[c] for c in act_cols if c in name_to_idx]
-    act_set = set(act_indices)
 
     mono_map: Dict[int, int] = {}
     for c_name, s_val in monotonic_dirs.items():
@@ -251,8 +402,14 @@ def optimize_group_and_hybrid_recourse(
     q_lo = np.percentile(X_train_ref, 2, axis=0)
     q_hi = np.percentile(X_train_ref, 98, axis=0)
 
-    # Identify safe (low-risk) reference pool in X_train_ref
-    train_probs = predict_proba_fn(X_train_ref)
+    is_oof = isinstance(predictor, OOFTabularEnsemble)
+    if ref_probs is not None:
+        train_probs = ref_probs
+    elif is_oof:
+        train_probs = predictor.oof_probs
+    else:
+        train_probs = predictor(X_train_ref)
+
     safe_pool = X_train_ref[train_probs < 0.22]
     if len(safe_pool) < 10:
         safe_pool = X_train_ref[np.argsort(train_probs)[: max(20, len(X_train_ref) // 5)]]
@@ -262,7 +419,7 @@ def optimize_group_and_hybrid_recourse(
     n_clusters = len(unique_clusters)
 
     variants = ["A1_none", "A2_tier", "A3_monotone", "A4_budget@low", "A4_budget@mid", "A4_budget@high"]
-    results: Dict[str, Dict[str, float]] = {}
+    results: Dict[str, Dict[str, Any]] = {}
 
     for var in variants:
         flipped_grp = np.zeros(n_risk, dtype=bool)
@@ -277,8 +434,11 @@ def optimize_group_and_hybrid_recourse(
             b_key = var.split("@")[1]
             budget_cap = budgets[b_key]
 
+        enforce_mono = var in ("A3_monotone", "A4_budget@low", "A4_budget@mid", "A4_budget@high")
+
         for c in unique_clusters:
             c_idx = np.where(labels == c)[0]
+            c_orig = orig_indices[c_idx] if orig_indices is not None else c_idx
             X_c = X_at_risk[c_idx]
             phi_c = phi_at_risk[c_idx]
             centroid = np.mean(X_c, axis=0)
@@ -286,16 +446,15 @@ def optimize_group_and_hybrid_recourse(
             dists = np.linalg.norm((safe_pool - centroid[None, :]) / iqr_scales[None, :], axis=1)
             nearest_safe = safe_pool[int(np.argmin(dists))]
 
-            # Determine candidate features to modify for this cluster (all methods get k=3 cap)
+            # Feature ranking & paradigm target anchor (all methods receive k_max = 3)
             if var == "A1_none":
-                # Unconstrained: picks top-3 features with largest difference to safe median across all d features
                 diff_norm = np.abs(safe_med - centroid) / iqr_scales
                 top_feats = np.argsort(-diff_norm)[:3].tolist()
-                delta_dir = safe_med - centroid
+                delta_dir = np.zeros(d, dtype=np.float64)
+                for j in top_feats:
+                    delta_dir[j] = safe_med[j] - centroid[j]
             else:
-                # Tier-constrained (A2, A3, A4): restricted strictly to F_act, equal k=3 cap across all methods
-                if method in ("Proposed_SA_AASC", "SA_AASC_DirOnly", "SA_AASC_DirPlusRoom"):
-                    # Prioritize actionable features by cluster-mean deficit attribution * feasible room
+                if method in ("Proposed_SA_AASC", "SA_AASC_DirOnly", "SA_AASC_DirPlusRoom", "B3_Full_SHAP_Cone"):
                     scores_act = []
                     for j in act_indices:
                         s_j = mono_map.get(j, 1)
@@ -306,7 +465,6 @@ def optimize_group_and_hybrid_recourse(
                     scores_act.sort(reverse=True)
                     top_feats = [j for _, j in scores_act[:3]]
                 elif method == "B3_Full_SHAP":
-                    # Ranks by full SHAP magnitude projected onto F_act (k=3)
                     mean_abs_phi = np.mean(np.abs(phi_c), axis=0)
                     ranked_act = sorted(act_indices, key=lambda j: -mean_abs_phi[j])
                     top_feats = ranked_act[:3]
@@ -315,7 +473,6 @@ def optimize_group_and_hybrid_recourse(
                     diff_act.sort(reverse=True)
                     top_feats = [j for _, j in diff_act[:3]]
                 else:
-                    # B1_Raw_X: nearest safe neighbor in full raw space, then project onto F_act (k=3)
                     diff_act = [(abs(nearest_safe[j] - centroid[j]) / iqr_scales[j], j) for j in act_indices]
                     diff_act.sort(reverse=True)
                     top_feats = [j for _, j in diff_act[:3]]
@@ -323,8 +480,8 @@ def optimize_group_and_hybrid_recourse(
                 delta_dir = np.zeros(d, dtype=np.float64)
                 for j in top_feats:
                     s_j = mono_map.get(j, 1)
-                    if var in ("A3_monotone", "A4_budget@low", "A4_budget@mid", "A4_budget@high"):
-                        if method in ("Proposed_SA_AASC", "SA_AASC_DirOnly", "SA_AASC_DirPlusRoom"):
+                    if enforce_mono:
+                        if method in ("Proposed_SA_AASC", "SA_AASC_DirOnly", "SA_AASC_DirPlusRoom", "B3_Full_SHAP_Cone"):
                             target_val = q_hi[j] if s_j >= 0 else q_lo[j]
                         elif method == "B1_Raw_X":
                             target_val = nearest_safe[j]
@@ -332,26 +489,16 @@ def optimize_group_and_hybrid_recourse(
                             target_val = safe_med[j]
                         delta_dir[j] = target_val - centroid[j]
                     else:
-                        # A2_tier without monotonic cone: moves toward safe_med
                         delta_dir[j] = safe_med[j] - centroid[j]
 
-            # Line-search optimal group shift along selected features
-            best_delta = np.zeros(d, dtype=np.float64)
-            best_flip_rate = -1.0
-
+            # Strictly matched candidate schedule construction (exact 96 schedules for all methods)
             if use_water_filling and var != "A1_none":
-                # Shared water-filling schedule across all clustering methods (k=1, 2, 3 subsets, full 1.0*budget_cap)
                 cand_schedules = []
                 feature_subsets = [
                     top_feats[:1],
                     top_feats[:2],
                     top_feats[:3],
                 ]
-                if method in ("Proposed_SA_AASC", "SA_AASC_DirOnly", "SA_AASC_DirPlusRoom"):
-                    mean_abs_phi = np.mean(np.abs(phi_c), axis=0)
-                    mag_top2 = sorted(act_indices, key=lambda j: -mean_abs_phi[j])[:2]
-                    feature_subsets.extend([mag_top2[:1], mag_top2[:2]])
-
                 for active_sub in feature_subsets:
                     for split_r in (1.0, 0.80, 0.65, 0.50):
                         for alpha in np.linspace(0.25, 1.0, 8):
@@ -359,14 +506,18 @@ def optimize_group_and_hybrid_recourse(
                             rem_b = budget_cap if budget_cap is not None else 14.0
                             for rank_pos, j in enumerate(active_sub):
                                 s_j = mono_map.get(j, 1)
-                                if method in ("Proposed_SA_AASC", "SA_AASC_DirOnly", "SA_AASC_DirPlusRoom") and var in ("A3_monotone", "A4_budget@low", "A4_budget@mid", "A4_budget@high"):
-                                    target_val = q_hi[j] if s_j >= 0 else q_lo[j]
-                                elif method == "B1_Raw_X" and var in ("A3_monotone", "A4_budget@low", "A4_budget@mid", "A4_budget@high"):
-                                    target_val = nearest_safe[j]
+                                if enforce_mono:
+                                    if method in ("Proposed_SA_AASC", "SA_AASC_DirOnly", "SA_AASC_DirPlusRoom", "B3_Full_SHAP_Cone"):
+                                        target_val = q_hi[j] if s_j >= 0 else q_lo[j]
+                                    elif method == "B1_Raw_X":
+                                        target_val = nearest_safe[j]
+                                    else:
+                                        target_val = safe_med[j]
                                 else:
                                     target_val = safe_med[j]
+
                                 raw_step = alpha * (target_val - centroid[j])
-                                if var in ("A3_monotone", "A4_budget@low", "A4_budget@mid", "A4_budget@high"):
+                                if enforce_mono:
                                     if (s_j >= 0 and raw_step < 0) or (s_j < 0 and raw_step > 0):
                                         raw_step = 0.0
                                 cost_j = abs(raw_step) / iqr_scales[j]
@@ -384,59 +535,38 @@ def optimize_group_and_hybrid_recourse(
                     cand_delta = np.zeros(d, dtype=np.float64)
                     for j in top_feats:
                         cand_delta[j] = alpha * delta_dir[j]
-                    if var in ("A3_monotone", "A4_budget@low", "A4_budget@mid", "A4_budget@high"):
+                    if enforce_mono:
                         for j in top_feats:
                             s_j = mono_map.get(j, 1)
                             if (s_j >= 0 and cand_delta[j] < 0) or (s_j < 0 and cand_delta[j] > 0):
                                 cand_delta[j] = 0.0
                     step_cost = float(np.sum(np.abs(cand_delta) / iqr_scales))
                     if budget_cap is not None and step_cost > budget_cap and step_cost > 1e-8:
-                        scale_factor = budget_cap / step_cost
-                        cand_delta = cand_delta * scale_factor
+                        cand_delta = cand_delta * (budget_cap / step_cost)
                     cand_schedules.append(cand_delta)
 
-            if cand_schedules:
-                cand_arr = np.asarray(cand_schedules, dtype=np.float64)  # (M, d)
-                n_m = len(cand_arr)
-                n_c = len(X_c)
-                X_batch = np.clip(
-                    X_c[None, :, :] + cand_arr[:, None, :],
-                    q_lo[None, None, :],
-                    q_hi[None, None, :],
-                )  # (M, n_c, d)
-                if var in ("A3_monotone", "A4_budget@low", "A4_budget@mid", "A4_budget@high"):
-                    for j in act_indices:
-                        s_j = mono_map.get(j, 1)
-                        if s_j >= 0:
-                            X_batch[:, :, j] = np.maximum(X_c[None, :, j], X_batch[:, :, j])
-                        else:
-                            X_batch[:, :, j] = np.minimum(X_c[None, :, j], X_batch[:, :, j])
-                p_batch = predict_proba_fn(X_batch.reshape(n_m * n_c, d)).reshape(n_m, n_c)
-                flips_batch = p_batch < tau
-                scores_batch = np.mean(flips_batch, axis=1) + 1e-4 * (1.0 - np.mean(p_batch, axis=1))
-                best_idx = int(np.argmax(scores_batch))
-                best_flip_rate = float(scores_batch[best_idx])
-                best_delta = cand_arr[best_idx].copy()
+            cand_arr = np.asarray(cand_schedules, dtype=np.float64)
+            X_batch = _apply_candidates_strict(X_c, cand_arr, q_lo, q_hi, mono_map, enforce_mono)
+            if is_oof:
+                p_batch = predictor.predict_batch_for_indices(X_batch, c_orig)
+            else:
+                n_m, n_c_loc, _ = X_batch.shape
+                p_batch = predictor(X_batch.reshape(n_m * n_c_loc, d)).reshape(n_m, n_c_loc)
 
-            # Apply best group template to cluster c
-            X_c_grp = np.clip(X_c + best_delta[None, :], q_lo[None, :], q_hi[None, :])
-            if var in ("A3_monotone", "A4_budget@low", "A4_budget@mid", "A4_budget@high"):
-                for j in act_indices:
-                    s_j = mono_map.get(j, 1)
-                    if s_j >= 0:
-                        X_c_grp[:, j] = np.maximum(X_c[:, j], X_c_grp[:, j])
-                    else:
-                        X_c_grp[:, j] = np.minimum(X_c[:, j], X_c_grp[:, j])
+            flips_batch = p_batch < tau
+            scores_batch = np.mean(flips_batch, axis=1) + 1e-4 * (1.0 - np.mean(p_batch, axis=1))
+            best_idx = int(np.argmax(scores_batch))
 
-            p_grp = predict_proba_fn(X_c_grp)
-            c_flips = p_grp < tau
+            X_c_grp = X_batch[best_idx]
+            p_grp = p_batch[best_idx]
+            c_flips = flips_batch[best_idx]
             flipped_grp[c_idx] = c_flips
 
             inst_deltas = np.abs(X_c_grp - X_c) / iqr_scales[None, :]
             c_costs = np.sum(inst_deltas, axis=1)
             c_spars = np.sum(inst_deltas > 0.05, axis=1).astype(float)
             costs_grp[c_idx] = c_costs
-            sparsity_grp[c_idx] = np.maximum(c_spars, 1.0)
+            sparsity_grp[c_idx] = c_spars
 
             if float(np.mean(c_flips)) >= 0.50:
                 valid_cluster_count += 1
@@ -454,10 +584,15 @@ def optimize_group_and_hybrid_recourse(
                 trial_rows = []
                 for j_res in cand_pool:
                     s_j = mono_map.get(j_res, 1)
-                    bound_val = q_hi[j_res] if s_j >= 0 else q_lo[j_res]
-                    max_delta = bound_val - row_curr[j_res]
-                    if (s_j >= 0 and max_delta <= 0) or (s_j < 0 and max_delta >= 0):
-                        continue
+                    if enforce_mono:
+                        bound_val = max(row_curr[j_res], q_hi[j_res]) if s_j >= 0 else min(row_curr[j_res], q_lo[j_res])
+                        max_delta = bound_val - row_curr[j_res]
+                        if (s_j >= 0 and max_delta <= 0) or (s_j < 0 and max_delta >= 0):
+                            continue
+                    else:
+                        max_delta = safe_med[j_res] - row_curr[j_res]
+                        if abs(max_delta) <= 1e-8:
+                            continue
                     max_cost_j = abs(max_delta) / iqr_scales[j_res]
                     frac = min(1.0, rem_budget / max(max_cost_j, 1e-6))
                     trial_row = row_curr.copy()
@@ -465,24 +600,36 @@ def optimize_group_and_hybrid_recourse(
                     trial_rows.append(trial_row)
                 if trial_rows:
                     t_arr = np.asarray(trial_rows, dtype=np.float64)
-                    p_trials = predict_proba_fn(t_arr)
+                    if is_oof:
+                        p_trials = predictor.predict_single_student_trials(t_arr, int(c_orig[u_i]))
+                    else:
+                        p_trials = predictor(t_arr)
                     best_t_idx = int(np.argmin(p_trials))
                     if float(p_trials[best_t_idx]) < float(p_grp[u_i]):
                         X_c_hyb[u_i] = t_arr[best_t_idx]
 
-            p_hyb = predict_proba_fn(X_c_hyb)
+            if is_oof:
+                p_hyb = predictor.predict_for_indices(X_c_hyb, c_orig)
+            else:
+                p_hyb = predictor(X_c_hyb)
             flipped_hyb[c_idx] = p_hyb < tau
             costs_hyb[c_idx] = np.sum(np.abs(X_c_hyb - X_c) / iqr_scales[None, :], axis=1)
 
-        results[var] = {
+        entry: Dict[str, Any] = {
             "group_validity": float(np.mean(flipped_grp)),
             "hybrid_validity": float(np.mean(flipped_hyb)),
             "valid_clusters": int(valid_cluster_count),
             "total_clusters": int(n_clusters),
             "valid_cluster_ratio": float(valid_cluster_count / max(n_clusters, 1)),
             "mean_cost_group": float(np.mean(costs_grp)),
+            "max_cost_group": float(np.max(costs_grp)) if len(costs_grp) else 0.0,
             "mean_cost_hybrid": float(np.mean(costs_hyb)),
+            "max_cost_hybrid": float(np.max(costs_hyb)) if len(costs_hyb) else 0.0,
             "mean_sparsity": float(np.mean(sparsity_grp)),
         }
+        if return_vectors:
+            entry["_flipped_grp_vec"] = flipped_grp.copy()
+            entry["_flipped_hyb_vec"] = flipped_hyb.copy()
+        results[var] = entry
 
     return results

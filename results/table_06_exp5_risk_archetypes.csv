@@ -1,13 +1,13 @@
 dataset,archetype_id,cohort_share_pct,mean_initial_risk,primary_actionable_driver,primary_actionable_shap,secondary_actionable_driver,dominant_locked_context
-UCI #697,Archetype-1,51.0,0.9220603299299375,Curricular units 2nd sem (approved),3.3922996800875596,Curricular units 1st sem (approved),Tuition fees up to date
-UCI #697,Archetype-2,7.000000000000001,0.7769533714950028,Curricular units 1st sem (approved),0.6280319087435918,Curricular units 2nd sem (approved),Tuition fees up to date
-UCI #697,Archetype-3,37.333333333333336,0.8524105528231237,Curricular units 2nd sem (approved),2.253509554952712,Curricular units 1st sem (approved),Tuition fees up to date
-UCI #697,Archetype-4,4.666666666666667,0.6735841546307787,Curricular units 2nd sem (evaluations),0.32922789404872393,Curricular units 1st sem (evaluations),Tuition fees up to date
-xAPI-Edu,Archetype-1,38.095238095238095,0.9573370664565436,StudentAbsenceDays,2.8268081752147047,VisITedResources,ParentAnsweringSurvey
-xAPI-Edu,Archetype-2,30.952380952380953,0.7495131460524205,StudentAbsenceDays,3.377768162741279,VisITedResources,ParentAnsweringSurvey
-xAPI-Edu,Archetype-3,5.555555555555555,0.7402653713172711,raisedhands,2.0321790431511326,AnnouncementsView,gender
-xAPI-Edu,Archetype-4,25.396825396825395,0.8950800347099821,StudentAbsenceDays,2.3455885154834926,AnnouncementsView,ParentAnsweringSurvey
-OULAD (40% drop),Archetype-1,39.33333333333333,0.357471864025271,score_mean,0.8524255275876813,weighted_score_sum,date_registration
-OULAD (40% drop),Archetype-2,21.333333333333336,0.33093998476352254,weighted_score_sum,0.9227298997870559,submission_completion_ratio,date_registration
-OULAD (40% drop),Archetype-3,25.0,0.3540098555561248,weighted_score_sum,0.943786439942465,score_mean,code_presentation
-OULAD (40% drop),Archetype-4,14.333333333333334,0.3975996525310235,weighted_score_sum,1.0756096418631338,derived_submission_index,date_registration
+UCI #697,Archetype-1,30.333333333333336,0.8664100098280062,Curricular units 2nd sem (approved),2.1066759413798595,Curricular units 1st sem (approved),Tuition fees up to date
+UCI #697,Archetype-2,14.333333333333334,0.8722881596735735,Curricular units 1st sem (approved),0.5912203746989065,Curricular units 2nd sem (approved),Tuition fees up to date
+UCI #697,Archetype-3,48.333333333333336,0.946306938759854,Curricular units 2nd sem (approved),2.615530792023614,Curricular units 1st sem (approved),Tuition fees up to date
+UCI #697,Archetype-4,7.000000000000001,0.7664719848671375,Curricular units 2nd sem (evaluations),0.18126923676311332,Curricular units 2nd sem (grade),Tuition fees up to date
+xAPI-Edu,Archetype-1,23.387096774193548,0.8888071089122439,VisITedResources,2.792284011976165,raisedhands,ParentAnsweringSurvey
+xAPI-Edu,Archetype-2,37.903225806451616,0.9491302516277861,VisITedResources,2.295526082335335,StudentAbsenceDays,ParentAnsweringSurvey
+xAPI-Edu,Archetype-3,32.25806451612903,0.8064085799337981,StudentAbsenceDays,3.105188286181484,VisITedResources,ParentAnsweringSurvey
+xAPI-Edu,Archetype-4,6.451612903225806,0.7399891348996468,raisedhands,2.8889850837374347,AnnouncementsView,ParentAnsweringSurvey
+OULAD (40% drop),Archetype-1,17.666666666666668,0.3915164622521608,derived_submission_index,0.8424956655754988,early_preparation_days,code_module
+OULAD (40% drop),Archetype-2,39.33333333333333,0.3661451552090823,score_mean,0.44881517697995393,weighted_score_sum,code_module
+OULAD (40% drop),Archetype-3,24.0,0.3755770096239362,submission_completion_ratio,0.5687544149644173,weighted_score_sum,code_module
+OULAD (40% drop),Archetype-4,19.0,0.4575415185603332,score_max,0.34226876662595007,score_min,code_module

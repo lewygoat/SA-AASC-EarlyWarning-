@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this code, please cite the accompanying manuscript."
-title: "Stage-Aware Actionable Attribution Subspace Clustering for Student Early-Warning Systems"
+title: "Stage-Aware Attribution Subspace Clustering for Group Counterfactual Recourse in Student Early-Warning Systems"
 authors:
   - family-names: Wu
     given-names: Jing

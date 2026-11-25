@@ -24,6 +24,9 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 
 
+torch.set_num_threads(1)
+
+
 def set_torch_seed(seed: int = 42) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)

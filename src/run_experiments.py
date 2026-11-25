@@ -1,8 +1,9 @@
 """
-Master Runner with Defensive Strategy, Smoke-Test Gate, Preset-Target Verification,
-Auto-Adjustment Loop, and Result Archiving for Paper 2:
-"Bridging Temporal Deep Learning and Actionable Group Recourse: Stage-Aware
-Attribution Subspace Clustering for Student Early-Warning Systems"
+Master Runner with Defensive Strategy, Out-of-Fold Counterfactual Audit,
+Equalized 96-Schedule Water-Filling Search, Paired Bootstrap Confidence Intervals,
+and Multi-Seed / Threshold Sensitivity Checks for:
+"Stage-Aware Attribution Subspace Clustering for Group Counterfactual Recourse
+in Student Early-Warning Systems"
 """
 
 from __future__ import annotations
@@ -11,7 +12,11 @@ import argparse
 import json
 import os
 import time
-from typing import Any, Dict, List
+import warnings
+from typing import Any, Dict, List, Tuple
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 import numpy as np
 import pandas as pd
@@ -33,18 +38,18 @@ from defensive_data_loader import (
     verify_no_nan_inf,
 )
 from models_dl_ml import (
-    DualStreamTempGBDTClassifier,
     MaskAwareStageBiLSTMClassifier,
     RegularizedTabNetWrapper,
     UnmaskedLSTMWrapper,
 )
 from sa_aasc_recourse import (
+    OOFTabularEnsemble,
     cluster_at_risk_students,
     compute_intra_cluster_directional_homogeneity,
     compute_iqr_scales,
-    compute_local_shap_attributions,
     compute_tier_attribution_shares,
     optimize_group_and_hybrid_recourse,
+    paired_bootstrap_validity_ci,
 )
 
 
@@ -58,14 +63,14 @@ os.makedirs(FIGURES_DIR, exist_ok=True)
 def evaluate_models_cv(
     ds: Dict[str, Any],
     n_splits: int = 5,
-    seeds: List[int] = [42],
-    dl_epochs: int = 24,
-) -> Tuple[List[Dict[str, Any]], DualStreamTempGBDTClassifier, np.ndarray]:
+    seeds: List[int] = [42, 43],
+    dl_epochs: int = 22,
+) -> Tuple[List[Dict[str, Any]], OOFTabularEnsemble, np.ndarray]:
     """
-    Evaluate all 7 architectures (LogReg, RF, GBDT, MLP, Reg-TabNet, Unmasked-LSTM,
-    MA-BiLSTM, and Proposed MA-TempNet+GBDT) under stratified CV with defensive checks.
-    Returns summary rows, a fitted DualStreamTempGBDTClassifier on full data for
-    downstream XAI/recourse audit, and out-of-fold probabilities.
+    Evaluate all 8 architectures (LogReg, RF, MLP, Unmasked-LSTM, Reg-TabNet,
+    GBDT, MA-BiLSTM, and MA-TempNet+GBDT) under stratified CV with defensive checks.
+    Returns summary rows, a strictly leak-free 5-fold OOFTabularEnsemble for
+    downstream XAI/recourse audit, and out-of-fold ensemble probabilities.
     """
     X = ds["X_raw"]
     y = ds["y"]
@@ -139,13 +144,11 @@ def evaluate_models_cv(
             ma_lstm.fit(X_tr, seq_tr, mask_tr, y_tr)
             p_malstm, emb_te = ma_lstm.predict_proba_and_emb(X_te, seq_te, mask_te)
 
-            # 8. MA-TempNet+GBDT (Proposed Dual-Stream) with inner out-of-fold stacking
-            p_tr_dl, emb_tr = ma_lstm.predict_proba_and_emb(X_tr, seq_tr, mask_tr)
-            X_tr_aug = np.column_stack([X_tr, p_tr_dl[:, None], emb_tr])
+            # 8. MA-TempNet+GBDT (Proposed Dual-Stream) with inner 3-fold OOF stacking
             X_te_aug = np.column_stack([X_te, p_malstm[:, None], emb_te])
             inner = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
             oof_dl = np.zeros(len(tr_idx), dtype=np.float64)
-            oof_emb = np.zeros((len(tr_idx), emb_tr.shape[1]), dtype=np.float64)
+            oof_emb = np.zeros((len(tr_idx), emb_te.shape[1]), dtype=np.float64)
             for in_tr, in_val in inner.split(X_tr, y_tr):
                 inner_lstm = MaskAwareStageBiLSTMClassifier(
                     hidden_dim=32, emb_dim=12, epochs=dl_epochs, seed=seed
@@ -199,24 +202,21 @@ def evaluate_models_cv(
             }
         )
 
-    # Fit full DualStreamTempGBDTClassifier for downstream attribution & recourse audit
-    full_model = DualStreamTempGBDTClassifier(seed=seeds[0], epochs=dl_epochs)
-    full_model.fit(X, seq, mask, y)
-    return rows, full_model, oof_probs_proposed
+    # Strictly out-of-fold tabular ensemble (zero in-sample leakage for downstream XAI & recourse)
+    oof_tab_ens = OOFTabularEnsemble(X, y, n_splits=n_splits, seed=seeds[0])
+    return rows, oof_tab_ens, oof_probs_proposed
 
 
 def run_exp2_stage_drift_and_leadtime(
     smoke: bool = False,
-    cached_40: Dict[str, Tuple[ Dict[str, Any], List[Dict[str, Any]], DualStreamTempGBDTClassifier ]] | None = None,
+    cached_40: Dict[str, Tuple[Dict[str, Any], List[Dict[str, Any]], OOFTabularEnsemble]] | None = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Experiment 1B & Experiment 2:
     Across OULAD course progress stages (20%, 40%, 60%, 80%), evaluate:
-    1) Active-survivor (`drop`) vs. full-cohort (`raw`) predictive performance of
-       Unmasked-LSTM, MA-BiLSTM, GBDT, and MA-TempNet+GBDT under the unified
-       cross-validation protocol (max_samples=4500, 5-fold CV, seeds=[42, 43]).
-    2) Stage-wise evolution of 5-tier attribution shares (F_beh, F_out, F_inst, F_imm, F_der)
-       and pure-behavioural recourse feasibility window.
+    1) Active-survivor (`drop`) vs. full-cohort (`raw`) predictive performance.
+    2) Out-of-fold stage-wise evolution of 5-tier attribution shares and
+       pure-behavioural recourse feasibility window.
     """
     checkpoints = [0.20, 0.40, 0.60, 0.80]
     stage_pred_rows: List[Dict[str, Any]] = []
@@ -230,20 +230,23 @@ def run_exp2_stage_drift_and_leadtime(
     for cp in checkpoints:
         for coding in ["drop", "raw"]:
             if int(round(cp * 100)) == 40 and cached_40 is not None and coding in cached_40:
-                ds_cp, rows_cp, model_cp = cached_40[coding]
+                ds_cp, rows_cp, oof_tab_cp = cached_40[coding]
             else:
                 ds_cp = load_oulad_stage(cutoff_pct=cp, coding=coding, smoke=smoke, max_samples=max_n)
-                rows_cp, model_cp, _ = evaluate_models_cv(ds_cp, n_splits=n_splits, seeds=seeds, dl_epochs=dl_epochs)
+                rows_cp, oof_tab_cp, _ = evaluate_models_cv(ds_cp, n_splits=n_splits, seeds=seeds, dl_epochs=dl_epochs)
+
+            exact_surv_frac = (
+                1.0 if coding == "raw"
+                else float(ds_cp["n_survivor_cohort"] / max(ds_cp["n_full_cohort"], 1))
+            )
             for r in rows_cp:
                 if r["model"] in ("Unmasked-LSTM", "MA-BiLSTM", "GBDT", "MA-TempNet+GBDT (Proposed)"):
                     stage_pred_rows.append(
                         {
                             "cutoff_pct": int(cp * 100),
                             "coding": coding,
-                            "pos_rate": float(np.mean(ds_cp["y"])),
-                            "survivor_fraction": float(
-                                (1.0 - ds_cp["p_raw_full"]) / max(1.0 - ds_cp["p_drop_full"], 1e-6)
-                            ),
+                            "pos_rate": float(ds_cp["p_raw_full"] if coding == "raw" else ds_cp["p_drop_full"]),
+                            "survivor_fraction": exact_surv_frac,
                             "model": r["model"],
                             "auc_pr": r["auc_pr_mean"],
                             "auc_roc": r["auc_roc_mean"],
@@ -253,19 +256,17 @@ def run_exp2_stage_drift_and_leadtime(
                     )
 
             if coding == "drop":
-                # Compute stage attribution drift on active survivors
                 X_all = ds_cp["X_raw"]
-                probs_tab = model_cp.predict_proba_tabular(X_all)
+                probs_tab = oof_tab_cp.oof_probs
                 at_risk_idx = np.where(probs_tab >= 0.35)[0]
                 if len(at_risk_idx) < 30:
                     at_risk_idx = np.argsort(-probs_tab)[: min(120, len(X_all))]
-                X_eval = X_all[at_risk_idx[: min(200, len(at_risk_idx))]]
-                phi_cp = compute_local_shap_attributions(
-                    model_cp.predict_proba_tabular, X_eval, X_all, n_coalitions=8, seed=42
-                )
+                eval_idx = np.sort(at_risk_idx[: min(200, len(at_risk_idx))])
+                X_eval = X_all[eval_idx]
+
+                phi_cp = oof_tab_cp.compute_oof_shap(X_all, eval_idx, n_coalitions=8, seed=42)
                 shares = compute_tier_attribution_shares(phi_cp, ds_cp["feature_names"], ds_cp["tiers"])
 
-                # Also compute pure-behavioural (F_beh only) vs F_beh+F_out recourse flip rate at this checkpoint
                 iqr_sc = compute_iqr_scales(X_all)
                 beh_only_tiers = {
                     "F_imm": ds_cp["tiers"]["F_imm"] + ds_cp["tiers"]["F_out"],
@@ -284,15 +285,16 @@ def run_exp2_stage_drift_and_leadtime(
                     "Proposed_SA_AASC",
                     X_eval,
                     phi_cp,
-                    probs_tab[at_risk_idx[: len(X_eval)]],
+                    probs_tab[eval_idx],
                     beh_indices,
                     mono_idx,
                     (q_lo, q_hi),
                     n_clusters=10,
                     seed=42,
                 )
+                tau_beh = float(np.median(probs_tab[eval_idx]) * 0.88)
                 rec_beh = optimize_group_and_hybrid_recourse(
-                    model_cp.predict_proba_tabular,
+                    oof_tab_cp,
                     X_eval,
                     phi_cp,
                     labels_beh,
@@ -302,14 +304,17 @@ def run_exp2_stage_drift_and_leadtime(
                     ds_cp["monotonic_dirs"],
                     iqr_sc,
                     X_all,
-                    tau=float(np.median(probs_tab[at_risk_idx[: len(X_eval)]]) * 0.88),
+                    tau=tau_beh,
+                    budgets={"low": 3.0, "mid": 5.0, "high": 7.5},
+                    orig_indices=eval_idx,
+                    ref_probs=probs_tab,
                 )
 
                 stage_drift_rows.append(
                     {
                         "cutoff_pct": int(cp * 100),
-                        "active_survivors_n": ds_cp["n_survivor_cohort"],
-                        "survivor_pos_rate": ds_cp["p_drop_full"],
+                        "active_survivors_n": int(ds_cp["n_survivor_cohort"]),
+                        "survivor_pos_rate": float(ds_cp["p_drop_full"]),
                         "share_F_beh": shares["F_beh"],
                         "share_F_out": shares["F_out"],
                         "share_F_inst": shares["F_inst"],
@@ -324,33 +329,45 @@ def run_exp2_stage_drift_and_leadtime(
 
 
 def run_exp3_exp4_exp5_clustering_and_recourse(
-    datasets_models: List[Tuple[Dict[str, Any], DualStreamTempGBDTClassifier, np.ndarray]],
+    datasets_models: List[Tuple[Dict[str, Any], OOFTabularEnsemble, np.ndarray]],
     smoke: bool = False,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    Dict[str, Any],
+]:
     """
-    Run:
-    - Experiment 3: 4 Clustering Spaces x 6 Constraint Stages Group & Hybrid Recourse
-    - Experiment 3B: SA-AASC Coordinate-Block & Optimizer Ablation (DirOnly, DirPlusRoom, SingleScale, Full)
+    Run strictly out-of-fold, equal-96-candidate counterfactual experiments:
+    - Experiment 3: 4 Clustering Spaces x 6 Constraint Regimes (with uniform K=20 and 2,000-draw paired bootstrap 95% CIs)
+    - Experiment 3B: Coordinate-Block, Anchor-Control & Optimizer Ablation (with 5-seed mean ± SD across seeds 42..46)
+    - Experiment 3C: Screening Threshold tau_s Sensitivity Sweep
     - Experiment 4: Advising Capacity K_c in {5, 10, 15, 20} Pareto Frontier
-    - Experiment 5: Risk Archetype Profiling under SA-AASC
+    - Experiment 5: Risk Archetype Profiling under SA-AASC (K=4 macro-archetypes)
     """
     exp3_rows: List[Dict[str, Any]] = []
     exp3_comp_rows: List[Dict[str, Any]] = []
+    exp3_tau_rows: List[Dict[str, Any]] = []
     exp4_rows: List[Dict[str, Any]] = []
     exp5_rows: List[Dict[str, Any]] = []
+    bootstrap_summary: Dict[str, Any] = {}
 
-    cluster_counts_default = {"UCI #697": 22, "xAPI-Edu": 20}
+    k_default = 20
     budgets_by_ds = {
         "UCI #697": {"low": 3.2, "mid": 5.2, "high": 7.8},
         "xAPI-Edu": {"low": 1.6, "mid": 2.6, "high": 4.0},
+        "OULAD (40% drop)": {"low": 3.0, "mid": 5.0, "high": 7.5},
     }
+    cluster_seeds = [42] if smoke else [42, 43, 44, 45, 46]
 
-    for ds, model, oof_prob in datasets_models:
+    for ds, oof_tab, _ in datasets_models:
         ds_name = ds["name"]
         X_all = ds["X_raw"]
-        probs_all = oof_prob.copy()
+        probs_all = oof_tab.oof_probs.copy()
 
-        # Select at-risk evaluation pool using out-of-fold scores
+        # Select at-risk evaluation pool strictly using out-of-fold f_tab scores
         tau_eval = 0.50 if ("drop" not in ds_name) else float(np.percentile(probs_all, 82))
         tau_eval = max(min(tau_eval, 0.50), 0.25)
         risk_mask = probs_all >= tau_eval
@@ -367,13 +384,13 @@ def run_exp3_exp4_exp5_clustering_and_recourse(
         if len(risk_idx) > max_pool:
             rng = np.random.RandomState(42)
             risk_idx = np.sort(rng.choice(risk_idx, size=max_pool, replace=False))
+        else:
+            risk_idx = np.sort(risk_idx)
 
         X_risk = X_all[risk_idx]
         probs_risk = probs_all[risk_idx]
         eval_n = int(len(X_risk))
-        phi_risk = compute_local_shap_attributions(
-            model.predict_proba_tabular, X_risk, X_all, n_coalitions=8, seed=42
-        )
+        phi_risk = oof_tab.compute_oof_shap(X_all, risk_idx, n_coalitions=8, seed=42)
 
         name_to_idx = {c: i for i, c in enumerate(ds["feature_names"])}
         act_cols = ds["tiers"]["F_beh"] + ds["tiers"]["F_out"]
@@ -383,41 +400,40 @@ def run_exp3_exp4_exp5_clustering_and_recourse(
         q_lo = np.percentile(X_all, 2, axis=0)
         q_hi = np.percentile(X_all, 98, axis=0)
         iqr_scales = compute_iqr_scales(X_all)
-        k_default = cluster_counts_default.get(ds_name, 21)
         b_map = budgets_by_ds.get(ds_name, {"low": 3.0, "mid": 5.0, "high": 7.5})
 
+        mid_flip_vecs_grp: Dict[str, np.ndarray] = {}
+        mid_flip_vecs_hyb: Dict[str, np.ndarray] = {}
+
         for c_method in ["B1_Raw_X", "B2_Actionable_X", "B3_Full_SHAP", "Proposed_SA_AASC"]:
-            labels = cluster_at_risk_students(
-                c_method,
-                X_risk,
-                phi_risk,
-                probs_risk,
-                act_indices,
-                mono_idx,
-                (q_lo, q_hi),
-                n_clusters=k_default,
-                seed=42,
-            )
-            icdh = compute_intra_cluster_directional_homogeneity(phi_risk[:, act_indices], labels)
-            rec_res = optimize_group_and_hybrid_recourse(
-                model.predict_proba_tabular,
-                X_risk,
-                phi_risk,
-                labels,
-                c_method,
-                ds["feature_names"],
-                ds["tiers"],
-                ds["monotonic_dirs"],
-                iqr_scales,
-                X_all,
-                tau=tau_eval,
-                budgets=b_map,
-                use_water_filling=True,
-            )
+            # Multi-seed evaluation under A4_budget@mid across 5 K-Means seeds
+            multiseed_grp = []
+            multiseed_hyb = []
+            for s_k in cluster_seeds:
+                lbl_s = cluster_at_risk_students(
+                    c_method, X_risk, phi_risk, probs_risk, act_indices, mono_idx, (q_lo, q_hi), n_clusters=k_default, seed=s_k
+                )
+                res_s = optimize_group_and_hybrid_recourse(
+                    oof_tab, X_risk, phi_risk, lbl_s, c_method,
+                    ds["feature_names"], ds["tiers"], ds["monotonic_dirs"], iqr_scales, X_all,
+                    tau=tau_eval, budgets=b_map, use_water_filling=True,
+                    orig_indices=risk_idx, ref_probs=probs_all,
+                    return_vectors=(s_k == 42),
+                )
+                multiseed_grp.append(res_s["A4_budget@mid"]["group_validity"])
+                multiseed_hyb.append(res_s["A4_budget@mid"]["hybrid_validity"])
+                if s_k == 42:
+                    rec_res = res_s
+                    icdh = compute_intra_cluster_directional_homogeneity(phi_risk[:, act_indices], lbl_s)
+
+            mid_flip_vecs_grp[c_method] = rec_res["A4_budget@mid"]["_flipped_grp_vec"]
+            mid_flip_vecs_hyb[c_method] = rec_res["A4_budget@mid"]["_flipped_hyb_vec"]
+
             for var_name, m_vals in rec_res.items():
                 exp3_rows.append(
                     {
                         "dataset": ds_name,
+                        "cluster_K": k_default,
                         "tau_eval": float(tau_eval),
                         "total_at_risk_pool": total_at_risk_pool,
                         "evaluated_at_risk_n": eval_n,
@@ -425,93 +441,135 @@ def run_exp3_exp4_exp5_clustering_and_recourse(
                         "constraint_variant": var_name,
                         "icdh": icdh,
                         "group_validity": m_vals["group_validity"],
+                        "group_validity_5seed_mean": float(np.mean(multiseed_grp)) if var_name == "A4_budget@mid" else m_vals["group_validity"],
+                        "group_validity_5seed_std": float(np.std(multiseed_grp, ddof=1)) if (var_name == "A4_budget@mid" and len(multiseed_grp) > 1) else 0.0,
                         "hybrid_validity": m_vals["hybrid_validity"],
+                        "hybrid_validity_5seed_mean": float(np.mean(multiseed_hyb)) if var_name == "A4_budget@mid" else m_vals["hybrid_validity"],
+                        "hybrid_validity_5seed_std": float(np.std(multiseed_hyb, ddof=1)) if (var_name == "A4_budget@mid" and len(multiseed_hyb) > 1) else 0.0,
                         "valid_clusters": m_vals["valid_clusters"],
                         "total_clusters": m_vals["total_clusters"],
                         "valid_cluster_ratio": m_vals["valid_cluster_ratio"],
                         "mean_cost_group": m_vals["mean_cost_group"],
+                        "max_cost_group": m_vals["max_cost_group"],
                         "mean_cost_hybrid": m_vals["mean_cost_hybrid"],
+                        "max_cost_hybrid": m_vals["max_cost_hybrid"],
                         "mean_sparsity": m_vals["mean_sparsity"],
                     }
                 )
 
-        # Experiment 3B: Coordinate-Block & Optimizer Ablation under A4_budget@mid
+        # Paired 2,000-iteration student-level bootstrap 95% CIs at A4_budget@mid
+        d_b1, lo_b1, hi_b1 = paired_bootstrap_validity_ci(mid_flip_vecs_grp["Proposed_SA_AASC"], mid_flip_vecs_grp["B1_Raw_X"])
+        d_b2, lo_b2, hi_b2 = paired_bootstrap_validity_ci(mid_flip_vecs_grp["Proposed_SA_AASC"], mid_flip_vecs_grp["B2_Actionable_X"])
+        d_b3, lo_b3, hi_b3 = paired_bootstrap_validity_ci(mid_flip_vecs_grp["Proposed_SA_AASC"], mid_flip_vecs_grp["B3_Full_SHAP"])
+        bootstrap_summary[ds_name] = {
+            "n_eval": eval_n,
+            "vs_B1_Raw_X": {"diff": d_b1, "ci95_lo": lo_b1, "ci95_hi": hi_b1},
+            "vs_B2_Actionable_X": {"diff": d_b2, "ci95_lo": lo_b2, "ci95_hi": hi_b2},
+            "vs_B3_Full_SHAP": {"diff": d_b3, "ci95_lo": lo_b3, "ci95_hi": hi_b3},
+        }
+
+        # Experiment 3B: Coordinate-Block, Anchor-Control & Optimizer Ablation under A4_budget@mid (5 seeds)
         for ab_label, c_space, use_wf in [
+            ("B3_Full_SHAP_Cone", "B3_Full_SHAP_Cone", True),
             ("SA_AASC_DirOnly", "SA_AASC_DirOnly", True),
             ("SA_AASC_DirPlusRoom", "SA_AASC_DirPlusRoom", True),
             ("Proposed_SA_AASC_SingleScale", "Proposed_SA_AASC", False),
             ("Proposed_SA_AASC_Full", "Proposed_SA_AASC", True),
         ]:
-            lbl_ab = cluster_at_risk_students(
-                c_space,
-                X_risk,
-                phi_risk,
-                probs_risk,
-                act_indices,
-                mono_idx,
-                (q_lo, q_hi),
-                n_clusters=k_default,
-                seed=42,
-            )
-            icdh_ab = compute_intra_cluster_directional_homogeneity(phi_risk[:, act_indices], lbl_ab)
-            rec_ab = optimize_group_and_hybrid_recourse(
-                model.predict_proba_tabular,
-                X_risk,
-                phi_risk,
-                lbl_ab,
-                c_space,
-                ds["feature_names"],
-                ds["tiers"],
-                ds["monotonic_dirs"],
-                iqr_scales,
-                X_all,
-                tau=tau_eval,
-                budgets=b_map,
-                use_water_filling=use_wf,
-            )["A4_budget@mid"]
+            ab_grp_seeds, ab_hyb_seeds = [], []
+            rec_ab_42 = None
+            icdh_ab_42 = 0.0
+            for s_k in cluster_seeds:
+                lbl_ab = cluster_at_risk_students(
+                    c_space, X_risk, phi_risk, probs_risk, act_indices, mono_idx, (q_lo, q_hi), n_clusters=k_default, seed=s_k
+                )
+                rec_ab = optimize_group_and_hybrid_recourse(
+                    oof_tab, X_risk, phi_risk, lbl_ab, c_space,
+                    ds["feature_names"], ds["tiers"], ds["monotonic_dirs"], iqr_scales, X_all,
+                    tau=tau_eval, budgets=b_map, use_water_filling=use_wf,
+                    orig_indices=risk_idx, ref_probs=probs_all,
+                )["A4_budget@mid"]
+                ab_grp_seeds.append(rec_ab["group_validity"])
+                ab_hyb_seeds.append(rec_ab["hybrid_validity"])
+                if s_k == 42:
+                    rec_ab_42 = rec_ab
+                    icdh_ab_42 = compute_intra_cluster_directional_homogeneity(phi_risk[:, act_indices], lbl_ab)
+
+            assert rec_ab_42 is not None
             exp3_comp_rows.append(
                 {
                     "dataset": ds_name,
                     "ablation_variant": ab_label,
-                    "icdh": icdh_ab,
-                    "group_validity": rec_ab["group_validity"],
-                    "hybrid_validity": rec_ab["hybrid_validity"],
-                    "valid_clusters": rec_ab["valid_clusters"],
-                    "total_clusters": rec_ab["total_clusters"],
-                    "valid_cluster_ratio": rec_ab["valid_cluster_ratio"],
-                    "mean_cost_group": rec_ab["mean_cost_group"],
-                    "mean_sparsity": rec_ab["mean_sparsity"],
+                    "icdh": icdh_ab_42,
+                    "group_validity": rec_ab_42["group_validity"],
+                    "group_validity_5seed_mean": float(np.mean(ab_grp_seeds)),
+                    "group_validity_5seed_std": float(np.std(ab_grp_seeds, ddof=1)) if len(ab_grp_seeds) > 1 else 0.0,
+                    "hybrid_validity": rec_ab_42["hybrid_validity"],
+                    "hybrid_validity_5seed_mean": float(np.mean(ab_hyb_seeds)),
+                    "hybrid_validity_5seed_std": float(np.std(ab_hyb_seeds, ddof=1)) if len(ab_hyb_seeds) > 1 else 0.0,
+                    "valid_clusters": rec_ab_42["valid_clusters"],
+                    "total_clusters": rec_ab_42["total_clusters"],
+                    "valid_cluster_ratio": rec_ab_42["valid_cluster_ratio"],
+                    "mean_cost_group": rec_ab_42["mean_cost_group"],
+                    "mean_sparsity": rec_ab_42["mean_sparsity"],
                 }
             )
 
+        # Experiment 3C: Screening threshold tau_s sensitivity sweep under A4_budget@mid
+        if "drop" not in ds_name:
+            tau_grid = [("tau=0.40", 0.40), ("tau=0.50 (default)", 0.50), ("tau=0.60", 0.60)]
+        else:
+            tau_grid = [
+                ("78th pct", max(min(float(np.percentile(probs_all, 78)), 0.50), 0.20)),
+                ("82nd pct (default)", tau_eval),
+                ("86th pct", max(min(float(np.percentile(probs_all, 86)), 0.50), 0.28)),
+            ]
+        for tau_lbl, t_val in tau_grid:
+            t_idx = np.where(probs_all >= t_val)[0]
+            if len(t_idx) < 30:
+                continue
+            if len(t_idx) > max_pool:
+                t_idx = np.sort(np.random.RandomState(42).choice(t_idx, size=max_pool, replace=False))
+            else:
+                t_idx = np.sort(t_idx)
+            X_t = X_all[t_idx]
+            p_t = probs_all[t_idx]
+            phi_t = oof_tab.compute_oof_shap(X_all, t_idx, n_coalitions=8, seed=42)
+            for m_tau in ["B1_Raw_X", "B3_Full_SHAP", "Proposed_SA_AASC"]:
+                lbl_t = cluster_at_risk_students(
+                    m_tau, X_t, phi_t, p_t, act_indices, mono_idx, (q_lo, q_hi), n_clusters=k_default, seed=42
+                )
+                rec_t = optimize_group_and_hybrid_recourse(
+                    oof_tab, X_t, phi_t, lbl_t, m_tau,
+                    ds["feature_names"], ds["tiers"], ds["monotonic_dirs"], iqr_scales, X_all,
+                    tau=t_val, budgets=b_map, use_water_filling=True,
+                    orig_indices=t_idx, ref_probs=probs_all,
+                )["A4_budget@mid"]
+                exp3_tau_rows.append(
+                    {
+                        "dataset": ds_name,
+                        "tau_setting": tau_lbl,
+                        "tau_value": round(float(t_val), 4),
+                        "evaluated_n": int(len(t_idx)),
+                        "clustering_method": m_tau,
+                        "group_validity": rec_t["group_validity"],
+                        "hybrid_validity": rec_t["hybrid_validity"],
+                        "mean_cost_group": rec_t["mean_cost_group"],
+                    }
+                )
+
         # Experiment 4: Advising Capacity K_c sweep in {5, 10, 15, 20} under A4_budget@mid
         for k_cap in [5, 10, 15, 20]:
-            for c_method in ["B1_Raw_X", "Proposed_SA_AASC"]:
+            for c_method in ["B1_Raw_X", "B3_Full_SHAP", "Proposed_SA_AASC"]:
                 labels_k = cluster_at_risk_students(
-                    c_method,
-                    X_risk,
-                    phi_risk,
-                    probs_risk,
-                    act_indices,
-                    mono_idx,
-                    (q_lo, q_hi),
-                    n_clusters=k_cap,
-                    seed=42,
+                    c_method, X_risk, phi_risk, probs_risk, act_indices, mono_idx, (q_lo, q_hi), n_clusters=k_cap, seed=42
                 )
                 icdh_k = compute_intra_cluster_directional_homogeneity(phi_risk[:, act_indices], labels_k)
                 rec_k = optimize_group_and_hybrid_recourse(
-                    model.predict_proba_tabular,
-                    X_risk,
-                    phi_risk,
-                    labels_k,
-                    c_method,
-                    ds["feature_names"],
-                    ds["tiers"],
-                    ds["monotonic_dirs"],
-                    iqr_scales,
-                    X_all,
-                    tau=tau_eval,
-                    budgets=b_map,
+                    oof_tab, X_risk, phi_risk, labels_k, c_method,
+                    ds["feature_names"], ds["tiers"], ds["monotonic_dirs"], iqr_scales, X_all,
+                    tau=tau_eval, budgets=b_map, use_water_filling=True,
+                    orig_indices=risk_idx, ref_probs=probs_all,
                 )["A4_budget@mid"]
                 exp4_rows.append(
                     {
@@ -532,36 +590,13 @@ def run_exp3_exp4_exp5_clustering_and_recourse(
 
         # Experiment 5: Extract 4 representative Risk Archetypes under Proposed_SA_AASC (K=4 macro-archetypes)
         labels_arch = cluster_at_risk_students(
-            "Proposed_SA_AASC",
-            X_risk,
-            phi_risk,
-            probs_risk,
-            act_indices,
-            mono_idx,
-            (q_lo, q_hi),
-            n_clusters=4,
-            seed=42,
-        )
-        rec_arch = optimize_group_and_hybrid_recourse(
-            model.predict_proba_tabular,
-            X_risk,
-            phi_risk,
-            labels_arch,
-            "Proposed_SA_AASC",
-            ds["feature_names"],
-            ds["tiers"],
-            ds["monotonic_dirs"],
-            iqr_scales,
-            X_all,
-            tau=tau_eval,
-            budgets=b_map,
+            "Proposed_SA_AASC", X_risk, phi_risk, probs_risk, act_indices, mono_idx, (q_lo, q_hi), n_clusters=4, seed=42
         )
         for c_id in range(4):
             c_mask = labels_arch == c_id
             if not np.any(c_mask):
                 continue
             phi_sub = phi_risk[c_mask]
-            # Top-2 actionable deficit features and top-1 locked institutional/immutable driver
             act_scores = [(float(np.mean(np.maximum(0.0, phi_sub[:, j]))), ds["feature_names"][j]) for j in act_indices]
             act_scores.sort(reverse=True)
             locked_cols = ds["tiers"]["F_inst"] + ds["tiers"]["F_imm"]
@@ -582,18 +617,17 @@ def run_exp3_exp4_exp5_clustering_and_recourse(
                 }
             )
 
-    return exp3_rows, exp3_comp_rows, exp4_rows, exp5_rows
+    return exp3_rows, exp3_comp_rows, exp3_tau_rows, exp4_rows, exp5_rows, bootstrap_summary
 
 
 def summarize_measured_gates(
-    exp1_rows,
-    exp3_rows,
-):
-    """Descriptive audit of measured effects. Reports observed values only; no target is imposed."""
-    checks = {}
+    exp1_rows: List[Dict[str, Any]],
+    exp3_rows: List[Dict[str, Any]],
+    bootstrap_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Descriptive audit of measured effects and budget-compliance verification."""
+    checks: Dict[str, Any] = {}
     oulad_raw_rows = [r for r in exp1_rows if r["dataset"] == "OULAD (40% raw)"]
-    if not oulad_raw_rows:
-        oulad_raw_rows = [r for r in exp1_rows if "OULAD" in r["dataset"]]
     u_lstm_roc = next((r["auc_roc_mean"] for r in oulad_raw_rows if r["model"] == "Unmasked-LSTM"), 0.5)
     ma_lstm_roc = next((r["auc_roc_mean"] for r in oulad_raw_rows if r["model"] == "MA-BiLSTM"), 0.5)
     prop_roc = next((r["auc_roc_mean"] for r in oulad_raw_rows if r["model"] == "MA-TempNet+GBDT (Proposed)"), 0.5)
@@ -605,152 +639,47 @@ def summarize_measured_gates(
     checks["oulad_gbdt_roc"] = float(gbdt_roc)
 
     recourse_gains = {}
-    for ds_label in set(r["dataset"] for r in exp3_rows):
-        row_at = {}
-        for r in exp3_rows:
-            if r["dataset"] == ds_label and r["constraint_variant"] == "A4_budget@mid":
-                row_at[r["clustering_method"]] = r
+    for ds_label in sorted(set(r["dataset"] for r in exp3_rows)):
+        row_at = {
+            r["clustering_method"]: r
+            for r in exp3_rows
+            if r["dataset"] == ds_label and r["constraint_variant"] == "A4_budget@mid"
+        }
         b1_row = row_at.get("B1_Raw_X")
+        b2_row = row_at.get("B2_Actionable_X")
         b3_row = row_at.get("B3_Full_SHAP")
         prop_row = row_at.get("Proposed_SA_AASC")
         if b1_row and prop_row:
-            entry = {
+            entry: Dict[str, Any] = {
                 "B1_Raw_X_group_val": b1_row["group_validity"],
+                "B2_Actionable_X_group_val": b2_row["group_validity"] if b2_row else None,
+                "B3_Full_SHAP_group_val": b3_row["group_validity"] if b3_row else None,
                 "SA_AASC_group_val": prop_row["group_validity"],
+                "SA_AASC_group_val_5seed_mean": prop_row["group_validity_5seed_mean"],
+                "SA_AASC_group_val_5seed_std": prop_row["group_validity_5seed_std"],
                 "SA_AASC_hybrid_val": prop_row["hybrid_validity"],
                 "group_val_gain_vs_B1": float(prop_row["group_validity"] - b1_row["group_validity"]),
-                "B1_icdh": b1_row["icdh"],
-                "SA_AASC_icdh": prop_row["icdh"],
+                "group_val_gain_vs_B3": float(prop_row["group_validity"] - b3_row["group_validity"]) if b3_row else None,
                 "mean_cost_group_SA_AASC": prop_row["mean_cost_group"],
+                "max_cost_group_SA_AASC": prop_row["max_cost_group"],
+                "paired_bootstrap_95ci": bootstrap_summary.get(ds_label, {}),
             }
-            if b3_row:
-                entry["B3_Full_SHAP_group_val"] = b3_row["group_validity"]
-                entry["group_val_gain_vs_B3"] = float(prop_row["group_validity"] - b3_row["group_validity"])
-                entry["mean_cost_group_B3"] = b3_row["mean_cost_group"]
             recourse_gains[ds_label] = entry
     checks["recourse_gains_A4_mid"] = recourse_gains
     return checks
 
 
-def generate_publication_figures(
-    exp1_rows: List[Dict[str, Any]],
-    stage_pred_rows: List[Dict[str, Any]],
-    stage_drift_rows: List[Dict[str, Any]],
-    exp3_rows: List[Dict[str, Any]],
-    exp4_rows: List[Dict[str, Any]],
-) -> None:
-    """Generate 5 publication-grade 300-DPI figures summarizing all 5 experiments."""
-    plt.rcParams.update({"font.size": 10, "axes.titlesize": 11, "axes.labelsize": 10})
-
-    # Figure 1: Predictive comparison across datasets (Exp 1)
-    ds_list_exp1 = ["UCI #697", "xAPI-Edu", "OULAD (40% raw)", "OULAD (40% drop)"]
-    ds_list_exp1 = [d for d in ds_list_exp1 if any(r["dataset"] == d for r in exp1_rows)]
-    fig, axes = plt.subplots(1, len(ds_list_exp1), figsize=(4.2 * len(ds_list_exp1), 4.2), dpi=300)
-    if len(ds_list_exp1) == 1:
-        axes = [axes]
-    for ax, ds_name in zip(axes, ds_list_exp1):
-        sub = [r for r in exp1_rows if r["dataset"] == ds_name]
-        models = [r["model"].replace(" (Proposed)", "*") for r in sub]
-        auc_prs = [r["auc_pr_mean"] for r in sub]
-        auc_rocs = [r["auc_roc_mean"] for r in sub]
-        y_pos = np.arange(len(models))
-        ax.barh(y_pos - 0.18, auc_rocs, height=0.35, label="AUC-ROC", color="#2b5c8f")
-        ax.barh(y_pos + 0.18, auc_prs, height=0.35, label="AUC-PR", color="#d95f02")
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(models, fontsize=8.0)
-        ax.set_xlim(0.1, 1.02)
-        ax.set_title(ds_name)
-        ax.grid(axis="x", linestyle="--", alpha=0.4)
-    axes[0].legend(loc="lower right", fontsize=8.0)
-    plt.tight_layout()
-    plt.savefig(os.path.join(FIGURES_DIR, "fig1_model_prediction_comparison.png"), dpi=300)
-    plt.close()
-
-    ds_list = ["UCI #697", "xAPI-Edu", "OULAD (40% drop)"]
-    ds_list = [d for d in ds_list if any(r["dataset"] == d for r in exp3_rows)]
-
-    # Figure 2: Stage-Aware Attribution Drift & Pure-Behavioural Recourse Window across 20%..80% (Exp 2)
-    if stage_drift_rows:
-        fig, ax1 = plt.subplots(figsize=(7.5, 4.5), dpi=300)
-        cps = [r["cutoff_pct"] for r in stage_drift_rows]
-        s_beh = [r["share_F_beh"] * 100 for r in stage_drift_rows]
-        s_out = [r["share_F_out"] * 100 for r in stage_drift_rows]
-        s_inst = [r["share_F_inst"] * 100 for r in stage_drift_rows]
-        beh_val = [r["pure_beh_hybrid_validity"] * 100 for r in stage_drift_rows]
-
-        ax1.plot(cps, s_beh, "o-", linewidth=2.2, label="Behavioural Attribution Share (F_beh %)", color="#1b9e77")
-        ax1.plot(cps, s_out, "s--", linewidth=2.0, label="Assessment Outcome Share (F_out %)", color="#d95f02")
-        ax1.plot(cps, s_inst, "^:", linewidth=1.8, label="Institutional Share (F_inst %)", color="#7570b3")
-        ax1.plot(cps, beh_val, "D-", linewidth=2.4, label="Actionable Behavioural Recourse Rate (%)", color="#e7298a")
-        ax1.set_xlabel("Course Progress Checkpoint (%)")
-        ax1.set_ylabel("Percentage (%)")
-        ax1.set_xticks(cps)
-        ax1.set_title("Stage-Aware Attribution Drift & Actionable Window across Active Survivors")
-        ax1.grid(True, linestyle="--", alpha=0.4)
-        ax1.legend(loc="best", fontsize=8.5)
-        plt.tight_layout()
-        plt.savefig(os.path.join(FIGURES_DIR, "fig2_stage_attribution_drift.png"), dpi=300)
-        plt.close()
-
-    # Figure 3: 4 Clustering Spaces Group & Hybrid Recourse Validity under A4_budget@mid (Exp 3)
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.2), dpi=300)
-    for ax, ds_name in zip(axes, ds_list):
-        sub = [
-            r for r in exp3_rows
-            if r["dataset"] == ds_name and r["constraint_variant"] == "A4_budget@mid"
-        ]
-        methods = [r["clustering_method"].replace("Proposed_", "") for r in sub]
-        grp_v = [r["group_validity"] for r in sub]
-        hyb_v = [r["hybrid_validity"] for r in sub]
-        icdh_v = [r["icdh"] for r in sub]
-        x_p = np.arange(len(methods))
-        ax.bar(x_p - 0.25, grp_v, width=0.25, label="Group Template Validity", color="#386cb0")
-        ax.bar(x_p, hyb_v, width=0.25, label="Bi-Stage Hybrid Validity", color="#66a61e")
-        ax.bar(x_p + 0.25, icdh_v, width=0.25, label="Directional Homogeneity (ICDH)", color="#e6ab02")
-        ax.set_xticks(x_p)
-        ax.set_xticklabels(methods, rotation=20, fontsize=8.5)
-        ax.set_ylim(0.0, 1.05)
-        ax.set_title(f"{ds_name} (A4_budget@mid)")
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
-    axes[0].legend(loc="upper left", fontsize=8)
-    plt.tight_layout()
-    plt.savefig(os.path.join(FIGURES_DIR, "fig3_clustering_recourse_ablation.png"), dpi=300)
-    plt.close()
-
-    # Figure 4: Advising Capacity K_c Pareto Frontier (Exp 4)
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.0), dpi=300)
-    for ax, ds_name in zip(axes, ds_list):
-        for m_name, col, mk in [("B1_Raw_X", "#d95f02", "s--"), ("Proposed_SA_AASC", "#1b9e77", "o-")]:
-            sub = [r for r in exp4_rows if r["dataset"] == ds_name and r["clustering_method"] == m_name]
-            ks = [r["advising_capacity_K"] for r in sub]
-            g_val = [r["group_validity"] for r in sub]
-            h_val = [r["hybrid_validity"] for r in sub]
-            ax.plot(ks, g_val, mk, color=col, linewidth=2.0, label=f"{m_name} (Pure Group)")
-            ax.plot(ks, h_val, mk, color=col, linewidth=1.4, alpha=0.65, linestyle=":", label=f"{m_name} (Hybrid +1 Feat)")
-        ax.set_xlabel("Instructor Advising Capacity (Clusters K_c)")
-        ax.set_ylabel("Valid Recourse Rate")
-        ax.set_xticks([5, 10, 15, 20])
-        ax.set_ylim(0.0, 1.02)
-        ax.set_title(ds_name)
-        ax.grid(True, linestyle="--", alpha=0.4)
-    axes[0].legend(loc="lower right", fontsize=7.5)
-    plt.tight_layout()
-    plt.savefig(os.path.join(FIGURES_DIR, "fig4_advising_capacity_pareto.png"), dpi=300)
-    plt.close()
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run Paper 2 Experiments with Defensive Strategy")
+    parser = argparse.ArgumentParser(description="Run Experimental Pipeline with OOF & Equalized Recourse")
     parser.add_argument("--mode", choices=["smoke", "full"], default="smoke")
     args = parser.parse_args()
 
     smoke = args.mode == "smoke"
     t0 = time.time()
-    print(f"==================================================================")
-    print(f"[START] Running Paper 2 Experimental Pipeline in '{args.mode.upper()}' mode")
-    print(f"==================================================================")
+    print("==================================================================", flush=True)
+    print(f"[START] Running Experimental Pipeline in '{args.mode.upper()}' mode", flush=True)
+    print("==================================================================", flush=True)
 
-    # Load primary datasets (including OULAD 40% raw & active-survivor drop)
     ds_uci = load_uci697(smoke=smoke)
     ds_xapi = load_xapi_edu(smoke=smoke)
     ds_oulad40_raw = load_oulad_stage(cutoff_pct=0.40, coding="raw", smoke=smoke, max_samples=4500)
@@ -761,28 +690,28 @@ def main() -> None:
         f"UCI #697={ds_uci['X_raw'].shape}, "
         f"xAPI-Edu={ds_xapi['X_raw'].shape}, "
         f"OULAD-40%-raw={ds_oulad40_raw['X_raw'].shape}, "
-        f"OULAD-40%-drop={ds_oulad40_drop['X_raw'].shape}"
+        f"OULAD-40%-drop={ds_oulad40_drop['X_raw'].shape}",
+        flush=True,
     )
 
     n_splits = 3 if smoke else 5
     seeds = [42] if smoke else [42, 43]
     dl_epochs = 12 if smoke else 22
 
-    # Experiment 1: Multi-Model Predictive Evaluation
     exp1_all_rows: List[Dict[str, Any]] = []
-    datasets_models: List[Tuple[Dict[str, Any], DualStreamTempGBDTClassifier, np.ndarray]] = []
-    cached_40_oulad: Dict[str, Tuple[Dict[str, Any], List[Dict[str, Any]], DualStreamTempGBDTClassifier]] = {}
+    datasets_models: List[Tuple[Dict[str, Any], OOFTabularEnsemble, np.ndarray]] = []
+    cached_40_oulad: Dict[str, Tuple[Dict[str, Any], List[Dict[str, Any]], OOFTabularEnsemble]] = {}
 
     for ds in [ds_uci, ds_xapi, ds_oulad40_raw, ds_oulad40_drop]:
-        print(f"\n--- Running Experiment 1 (Prediction & Deep Temporal Fusion) on {ds['name']} ---")
-        rows_ds, fitted_model, oof_prob = evaluate_models_cv(ds, n_splits=n_splits, seeds=seeds, dl_epochs=dl_epochs)
+        print(f"\n--- Running Experiment 1 (Prediction & Deep Temporal Fusion) on {ds['name']} ---", flush=True)
+        rows_ds, oof_tab, oof_prob = evaluate_models_cv(ds, n_splits=n_splits, seeds=seeds, dl_epochs=dl_epochs)
         exp1_all_rows.extend(rows_ds)
         if ds["name"] != "OULAD (40% raw)":
-            datasets_models.append((ds, fitted_model, oof_prob))
+            datasets_models.append((ds, oof_tab, oof_prob))
         if ds["name"] == "OULAD (40% raw)":
-            cached_40_oulad["raw"] = (ds, rows_ds, fitted_model)
+            cached_40_oulad["raw"] = (ds, rows_ds, oof_tab)
         elif ds["name"] == "OULAD (40% drop)":
-            cached_40_oulad["drop"] = (ds, rows_ds, fitted_model)
+            cached_40_oulad["drop"] = (ds, rows_ds, oof_tab)
         for r in rows_ds:
             print(
                 f"  {r['model']:<28s} | AUC-PR={r['auc_pr_mean']:.4f} (±{r['auc_pr_std']:.4f}) | "
@@ -790,43 +719,43 @@ def main() -> None:
                 flush=True,
             )
 
-    # Experiment 2: Multi-Stage Progress Checkpoints (20%, 40%, 60%, 80%) & Attribution Drift
-    print(f"\n--- Running Experiment 2 (20%..80% Stage Checkpoints & Attribution Drift on OULAD) ---", flush=True)
+    print("\n--- Running Experiment 2 (20%..80% Stage Checkpoints & OOF Attribution Drift on OULAD) ---", flush=True)
     stage_pred_rows, stage_drift_rows = run_exp2_stage_drift_and_leadtime(smoke=smoke, cached_40=cached_40_oulad)
     for r in stage_drift_rows:
         print(
-            f"  Stage {r['cutoff_pct']}% (Survivors={r['active_survivors_n']}, pos={r['survivor_pos_rate']*100:.1f}%) | "
-            f"F_beh={r['share_F_beh']*100:.1f}%, F_out={r['share_F_out']*100:.1f}%, F_inst={r['share_F_inst']*100:.1f}% | "
-            f"Pure-Beh Hybrid Val={r['pure_beh_hybrid_validity']:.3f}",
+            f"  Stage {r['cutoff_pct']}% (Survivors={r['active_survivors_n']}, pos={r['survivor_pos_rate']*100:.2f}%) | "
+            f"F_beh={r['share_F_beh']*100:.2f}%, F_out={r['share_F_out']*100:.2f}%, F_inst={r['share_F_inst']*100:.2f}%, F_imm={r['share_F_imm']*100:.2f}% | "
+            f"Pure-Beh Grp/Hyb Val={r['pure_beh_group_validity']:.3f}/{r['pure_beh_hybrid_validity']:.3f}",
             flush=True,
         )
 
-    # Experiments 3, 4, 5: Subspace Clustering Recourse Ablation, Capacity Pareto, and Risk Archetypes
-    print(f"\n--- Running Experiments 3, 4, 5 (SA-AASC Clustering & Constrained Group Recourse) ---", flush=True)
-    exp3_rows, exp3_comp_rows, exp4_rows, exp5_rows = run_exp3_exp4_exp5_clustering_and_recourse(datasets_models, smoke=smoke)
+    print("\n--- Running Experiments 3, 4, 5 (OOF SA-AASC Clustering & Equal-96 Group Recourse) ---", flush=True)
+    exp3_rows, exp3_comp_rows, exp3_tau_rows, exp4_rows, exp5_rows, bootstrap_summary = run_exp3_exp4_exp5_clustering_and_recourse(
+        datasets_models, smoke=smoke
+    )
     for r in exp3_rows:
         if r["constraint_variant"] in ("A2_tier", "A4_budget@mid"):
             print(
                 f"  {r['dataset']:<18s} | {r['clustering_method']:<18s} | {r['constraint_variant']:<14s} | "
-                f"ICDH={r['icdh']:.3f} | GrpVal={r['group_validity']:.3f} | HybVal={r['hybrid_validity']:.3f} | "
-                f"ValidClusters={r['valid_clusters']}/{r['total_clusters']}",
+                f"ICDH={r['icdh']:.4f} | GrpVal={r['group_validity']:.4f} (5seed={r['group_validity_5seed_mean']:.4f}±{r['group_validity_5seed_std']:.4f}) | "
+                f"HybVal={r['hybrid_validity']:.4f} | ValidC={r['valid_clusters']}/{r['total_clusters']} | "
+                f"Cost={r['mean_cost_group']:.2f} (max={r['max_cost_group']:.2f})",
                 flush=True,
             )
 
-    # Defensive Preset-Target Verification Gate
-    checks = summarize_measured_gates(exp1_all_rows, exp3_rows)
-    print(f"\n==================================================================")
-    print("[AUDIT] Measured effect summary (no imposed target)")
+    checks = summarize_measured_gates(exp1_all_rows, exp3_rows, bootstrap_summary)
+    print("\n==================================================================", flush=True)
+    print("[AUDIT] Measured effect summary (strict OOF, equal 96 candidates, zero budget breach)", flush=True)
     print(json.dumps(checks, indent=2), flush=True)
-    print(f"==================================================================")
+    print("==================================================================", flush=True)
 
     if not smoke:
-        # Save CSVs, JSON archive, and 300-DPI figures
         pd.DataFrame(exp1_all_rows).to_csv(os.path.join(RESULTS_DIR, "table_01_exp1_prediction_comparison.csv"), index=False)
         pd.DataFrame(stage_pred_rows).to_csv(os.path.join(RESULTS_DIR, "table_02_exp2_stage_checkpoints.csv"), index=False)
         pd.DataFrame(stage_drift_rows).to_csv(os.path.join(RESULTS_DIR, "table_03_exp2_attribution_drift.csv"), index=False)
         pd.DataFrame(exp3_rows).to_csv(os.path.join(RESULTS_DIR, "table_04_exp3_clustering_recourse_ablation.csv"), index=False)
         pd.DataFrame(exp3_comp_rows).to_csv(os.path.join(RESULTS_DIR, "table_04b_sa_aasc_component_ablation.csv"), index=False)
+        pd.DataFrame(exp3_tau_rows).to_csv(os.path.join(RESULTS_DIR, "table_04c_tau_sensitivity.csv"), index=False)
         pd.DataFrame(exp4_rows).to_csv(os.path.join(RESULTS_DIR, "table_05_exp4_advising_capacity_pareto.csv"), index=False)
         pd.DataFrame(exp5_rows).to_csv(os.path.join(RESULTS_DIR, "table_06_exp5_risk_archetypes.csv"), index=False)
 
@@ -834,23 +763,24 @@ def main() -> None:
             "mode": args.mode,
             "elapsed_seconds": round(time.time() - t0, 2),
             "measured_effect_audit": checks,
+            "paired_bootstrap_95ci": bootstrap_summary,
             "table_01_exp1_prediction_comparison": exp1_all_rows,
             "table_02_exp2_stage_checkpoints": stage_pred_rows,
             "table_03_exp2_attribution_drift": stage_drift_rows,
             "table_04_exp3_clustering_recourse_ablation": exp3_rows,
             "table_04b_sa_aasc_component_ablation": exp3_comp_rows,
+            "table_04c_tau_sensitivity": exp3_tau_rows,
             "table_05_exp4_advising_capacity_pareto": exp4_rows,
             "table_06_exp5_risk_archetypes": exp5_rows,
         }
         with open(os.path.join(RESULTS_DIR, "final_experiment_results.json"), "w", encoding="utf-8") as f:
             json.dump(full_archive, f, indent=2, ensure_ascii=False)
 
-        generate_publication_figures(exp1_all_rows, stage_pred_rows, stage_drift_rows, exp3_rows, exp4_rows)
-        print(f"[SAVED] All 7 CSV tables, final_experiment_results.json, and publication figures saved to {RESULTS_DIR} and {FIGURES_DIR}!", flush=True)
+        print(f"[SAVED] All 8 CSV tables and final_experiment_results.json saved to {RESULTS_DIR} in {time.time() - t0:.1f}s!", flush=True)
     else:
         with open(os.path.join(RESULTS_DIR, "smoke_test_audit.json"), "w", encoding="utf-8") as f:
             json.dump(checks, f, indent=2, ensure_ascii=False)
-        print(f"[SMOKE TEST COMPLETE] Elapsed: {time.time() - t0:.1f}s")
+        print(f"[SMOKE TEST COMPLETE] Elapsed: {time.time() - t0:.1f}s", flush=True)
 
 
 if __name__ == "__main__":
